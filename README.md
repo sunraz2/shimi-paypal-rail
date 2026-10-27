@@ -79,3 +79,30 @@ curl -X POST $HOST/webhooks/paypal -H 'Content-Type: application/json' \
 - Subscriptions for recurring agent services
 
 MIT license. Built by Shimi Network.
+
+## Status and honest disclosure (updated 26 Oct 2026)
+
+**What is real in this repository**
+- `paypal.js`: a real PayPal Developer Platform integration (OAuth2, **Orders v2** create/capture with idempotency keys, and **webhook signature verification** through PayPal's `verify-webhook-signature` endpoint). Sandbox by default (`PAYPAL_ENV=live` for production).
+- `server.js`: the agent-facing rail. `POST /webhooks/paypal` is **fail-closed**: an event is accepted only if PayPal's own verification returns `SUCCESS`. A forged `status: COMPLETED` is rejected with `401`.
+- `test_security.js`: proves a forged webhook is rejected, no payment is marked verified and no commission is created.
+- `test.js`: the end-to-end ledger test (issue, verify, commission 14.98). It posts a flat event to itself, so it runs **only** with `ALLOW_UNSIGNED_TEST_WEBHOOKS=1`. It tests the ledger math, not a real PayPal payment.
+
+**What is not yet proven**
+- A real sandbox payment end to end. This needs sandbox credentials from developer.paypal.com (`PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`). Until they are set, `/create-payment-link` returns `"mode": "no_paypal_keys"` and does not pretend otherwise.
+- The in-memory ledger is a reference. Production uses a database.
+
+**Run it**
+```bash
+npm install
+npm test        # one command: starts the server itself and runs BOTH suites
+                # (security: forged webhook rejected; ledger: issue -> verify -> commission 14.98)
+
+# Real sandbox flow (needs credentials from developer.paypal.com)
+export PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_WEBHOOK_ID=...
+node server.js
+```
+`npm test` starts two private server instances: one strict (fail-closed, used by the security suite) and one with
+`ALLOW_UNSIGNED_TEST_WEBHOOKS=1` (local ledger test only). That flag must never be set in production.
+
+License: MIT (see `LICENSE`).

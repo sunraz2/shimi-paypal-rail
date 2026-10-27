@@ -3,8 +3,11 @@
 // This repo is the open, runnable reference: agents issue PayPal checkout,
 // webhooks verify payments, commissions settle to the referring agent.
 const express = require("express");
+const paypal = require("./paypal");
 const app = express();
-app.use(express.json());
+// Keep the RAW body: PayPal signature verification needs the exact bytes.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString("utf8"); } }));
+const PAYPAL_READY = !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
 
 // ---------- In production this is a database; here: in-memory ----------
 const payments = [];        // PaymentRecord
@@ -20,7 +23,7 @@ const AGENTS = ["shimi-leads", "shimi-clients", "shimi-finance", "shimi-pituach"
 //          customer_name?, customer_phone?, max_payments? }
 //   -> 200 { ok:true, payment_url, checkout_ref }
 //   -> 401 { ok:false, error:'make_api_key_rotated' }  (fail-closed on key rotation)
-app.post("/create-payment-link", (req, res) => {
+app.post("/create-payment-link", async (req, res) => {
   const { provider, amount_shekels, product, customer_name, customer_phone, max_payments, install_id } = req.body || {};
   if (!provider || !amount_shekels || !product)
     return res.status(400).json({ ok: false, error: "missing_fields", required: ["provider", "amount_shekels", "product"] });
@@ -28,16 +31,25 @@ app.post("/create-payment-link", (req, res) => {
     return res.status(400).json({ ok: false, error: "unknown_provider" });
 
   const checkout_ref = "chr_" + Math.random().toString(36).slice(2, 10);
-  const payment_url = `${req.protocol}://${req.get("host")}/checkout?ref=${checkout_ref}` +
+  let payment_url = `${req.protocol}://${req.get("host")}/checkout?ref=${checkout_ref}` +
     `&amount=${amount_shekels}&product=${encodeURIComponent(product)}`;
+  let order_id = null, mode = "no_paypal_keys";
+  if (provider === "paypal" && PAYPAL_READY) {
+    try {                                   // REAL PayPal Orders v2 (sandbox by default)
+      const base = `${req.protocol}://${req.get("host")}`;
+      const o = await paypal.createOrder({ amount: amount_shekels, currency: "ILS", description: product,
+        checkout_ref, return_url: base + "/paypal/return?ref=" + checkout_ref, cancel_url: base + "/checkout?ref=" + checkout_ref });
+      order_id = o.order_id; payment_url = o.approve_url || payment_url; mode = process.env.PAYPAL_ENV === "live" ? "live" : "sandbox";
+    } catch (e) { return res.status(502).json({ ok: false, error: "paypal_order_failed", detail: String(e.message).slice(0, 120) }); }
+  }
 
   payments.push({
-    checkout_ref, provider, amount_shekels, product, install_id,
+    checkout_ref, order_id, mode, provider, amount_shekels, product, install_id,
     customer_name, customer_phone, max_payments,
     status: "issued",          // issued -> paid -> verified
     created_at: new Date().toISOString()
   });
-  return res.json({ ok: true, payment_url, checkout_ref });
+  return res.json({ ok: true, payment_url, checkout_ref, order_id, mode });
 });
 
 // ---------- 2. Dynamic checkout page: one page per product ----------
@@ -56,8 +68,21 @@ app.get("/checkout", (req, res) => {
 
 // ---------- 3. Payment verification protocol ----------
 // An agent CLAIMING a payment is not evidence. Only the webhook record counts.
-app.post("/webhooks/paypal", (req, res) => {
-  const { checkout_ref, transaction_id, status } = req.body || {};
+app.post("/webhooks/paypal", async (req, res) => {
+  // FAIL CLOSED: a webhook is evidence only if PayPal's own signature check returns SUCCESS.
+  // (Set ALLOW_UNSIGNED_TEST_WEBHOOKS=1 ONLY for the local self-test; never in production.)
+  const unsignedOk = process.env.ALLOW_UNSIGNED_TEST_WEBHOOKS === "1";
+  if (!unsignedOk) {
+    let ok = false;
+    try { ok = await paypal.verifyWebhook(req.headers, req.rawBody || "{}"); } catch (_) { ok = false; }
+    if (!ok) return res.status(401).json({ ok: false, error: "invalid_webhook_signature" });
+  }
+  // Real PayPal events nest the data; the local self-test posts the flat shape.
+  const ev = req.body || {};
+  const res0 = ev.resource || {};
+  const checkout_ref = ev.checkout_ref || res0.custom_id || res0.supplementary_data?.related_ids?.order_id;
+  const transaction_id = ev.transaction_id || res0.id;
+  const status = ev.status || res0.status;
   const rec = payments.find(p => p.checkout_ref === checkout_ref);
   if (!rec) return res.status(404).json({ ok: false, error: "unknown_checkout_ref" });
   if (status !== "COMPLETED") { rec.status = "failed"; return res.json({ ok: true, verified: false }); }
